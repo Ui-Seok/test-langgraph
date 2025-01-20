@@ -45,6 +45,18 @@ def search_by_date(start_date: str = None, end_date: str = None, collection_name
     return formatted_results
 
 @tool
+def list_available_collections() -> str:
+    """List all available collections in the database.
+
+    Returns:
+        str: A string containing the list of collections.
+    """
+    collection_list = []
+    for collection_name in db.list_collection_names():
+        collection_list.append(collection_name)
+    return collection_list
+
+@tool
 def add(a: int, b: int) -> int:
     """Add two integers together.
 
@@ -57,7 +69,7 @@ def add(a: int, b: int) -> int:
     """
     return a + b
 
-tools = [search_by_date, add]
+tools = [search_by_date, add, list_available_collections]
 
 template = """
     Hello, I'm an AI assistant. I can help you with the following tasks:
@@ -85,10 +97,16 @@ print("#######################")
 messages.append(result)
 
 for tool_call in result:
-    selected_tool = {"add": add, "search_by_date": search_by_date}[tool_call["name"].lower()]
+    selected_tool = {
+        "add": add, 
+        "search_by_date": search_by_date, 
+        "list_available_collections": list_available_collections
+    }[tool_call["name"].lower()]
+
     tool_msg = selected_tool.invoke(tool_call)
     messages.append(tool_msg)
     
+print(messages)
 llm_answer = messages[2].content
 if llm_answer:
     print(f"LLM Answer: {llm_answer}")  # ToolMessage의 content를 출력 -> return 값과 동일

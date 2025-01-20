@@ -1,7 +1,7 @@
 from typing import Dict, List, Optional, Union
 from datetime import datetime
 from langchain.tools import tool
-from langchain.agents import AgentExecutor, create_react_agent
+from langchain.agents import AgentExecutor, create_react_agent, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_ollama import ChatOllama
 from langchain.memory import ConversationBufferMemory
@@ -41,65 +41,93 @@ class ConversationState(TypedDict):
     messages: List[Dict]
     current_step: str
     chat_history: List[Dict]
-    
-    # def __init__(self):
-    #     self.messages: List[Dict] = []
-    #     self.current_step: str = "START"
-    #     self.mongo_client = MongoClient(MONGODB_URI)
-    #     self.db = self.mongo_client[DB_NAME]
+'''Answer the following questions as best you can. You have access to the following tools:
+
+{tools}
+
+Use the following format:
+
+Question: the input question you must answer
+Thought: you should always think about what to do
+Action: the action to take, should be one of [{tool_names}]
+Action Input: the input to the action
+Observation: the result of the action
+... (this Thought/Action/Action Input/Observation can repeat N times)
+Thought: I now know the final answer
+Final Answer: the final answer to the original input question
+
+Begin!
+
+Question: {input}
+Thought:{agent_scratchpad}'''
+class ProcessUserInput:
+    def __init__(self, llm_model, tools):
+        self.llm_model = llm_model
+        self.tools = tools
+
+        # 프롬프트 템플릿 설정
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", """당신은 MongoDB 데이터베이스 전문가입니다. 
+            사용자의 질문에 따라 MongoDB에서 데이터를 검색하고 분석하는 것을 도와줍니다.
+
+            다음 도구들을 사용할 수 있습니다:
+            1. search_by_date: 날짜 범위로 데이터 검색 (형식: YYYY-MM-DD)
+            2. list_available_collections: 사용 가능한 컬렉션 목록 조회
+
+            사용자의 질문을 이해하고 적절한 도구를 선택하여 응답하세요.
+            날짜 검색 시에는 반드시 YYYY-MM-DD 형식을 사용해야 합니다."""),
+            ("placeholder", "{chat_history}"),
+            ("human", "{input}"),
+            ("placeholder", "{agent_scratchpad}"),
+        ])
+
+        agent = create_tool_calling_agent(llm_model, tools, prompt)
+
+        self.agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+
+    def __call__(self, state: ConversationState):
+        messages = state.get("messages", [])
+        chat_history = state.get("chat_history", [])
         
-    # def add_message(self, message: Dict):
-    #     self.messages.append(message)
+        # 현재 메시지 처리
+        current_message = messages[-1] if isinstance(messages, list) else messages
         
-# graph = StateGraph(ConversationState)
+        # 대화 이력을 포함한 프롬프트 생성
+        full_prompt = f"""Previous conversation:
+{chat_history}
 
-# def increment(state):
-#     return {"counter": state["counter"] + 1}
+Current question: {current_message}
 
-# graph.add_node("increment", increment)
+Please help the user with their request. You can use the following tools:
+- search_by_date: Search data by date range in MongoDB
+- list_available_collections: List all available collections in MongoDB
 
-# graph.add_edge(START, "increment")
-# graph.add_edge("increment", END)
+Remember the context of the conversation when responding."""
 
-# app = graph.compile()
+        try:
+            # Agent Executor를 통한 실행
+            result = self.agent_executor.invoke({"input": full_prompt})
+            response = result.get("output", "I couldn't process that request. Could you please rephrase?")
+            
+            # 대화 이력 업데이트
+            chat_history.append({"role": "user", "content": current_message})
+            chat_history.append({"role": "assistant", "content": response})
+            
+            return {
+                "messages": messages,
+                "current_step": "user_chat",
+                "chat_history": chat_history,
+                "response": response
+            }
+        except Exception as e:
+            print(f"Error in processing: {str(e)}")
+            return {
+                "messages": messages,
+                "current_step": "user_chat",
+                "chat_history": chat_history,
+                "response": "I encountered an error. Could you please try again?"
+            }
 
-# result = app.invoke({"counter": 2})
-
-# print(result)
-
-def process_user_input(state):
-    messages = state.get("messages", [])
-    chat_history = state.get("chat_history", [])
-    
-    if not messages:
-        return state
-    
-    llm = ChatOllama(model="llama3.1")
-    conversation_messages = []
-    for hist in chat_history:
-        if isinstance(hist, dict):
-            if hist.get("role") == "user":
-                conversation_messages.append(HumanMessage(content=hist["content"]))
-            elif hist.get("role") == "assistant":
-                conversation_messages.append(AIMessage(content=hist["content"]))
-                
-    current_message = messages if isinstance(messages, str) else messages[-1]
-    conversation_messages.append(HumanMessage(content=current_message))
-    # user_input = messages[-1] if isinstance(messages, list) else messages
-        
-    result = llm.invoke(conversation_messages)
-    print(f"AI Agent Response: {result.content}")
-    
-    updated_history = chat_history + [
-        {"role": "user", "content": current_message},
-        {"role": "assistant", "content": result.content}
-    ]
-    
-    return {
-        "messages": result.content,
-        "current_step": "processing",
-        "chat_history": updated_history
-    }
 
 def user_chat(state: ConversationState) -> str:
     input_message = input("User: ")
@@ -119,7 +147,9 @@ def should_end(state: ConversationState) -> bool:
         last_message = str(messages).lower()
     return any(word in last_message for word in ["exit", "quit", "q"])
 
-def build_conversation_graph() -> StateGraph:
+def build_conversation_graph(llm_model, tools) -> StateGraph:
+    process_user_input = ProcessUserInput(llm_model, tools)
+
     workflow = StateGraph(ConversationState)
     memory = MemorySaver()
     
@@ -144,6 +174,39 @@ def build_conversation_graph() -> StateGraph:
     
     return workflow.compile(checkpointer=memory)
 
+@tool
+def list_available_collections() -> str:
+    """List all available collections in the MongoDB database.
+
+    Returns:
+        str: A string containing the list of collections.
+    """
+    db = mongodb_client[DB_NAME]
+    collection_list = []
+    for collection_name in db.list_collection_names():
+        collection_list.append(collection_name)
+    # print(collection_list)
+    return collection_list
+
+@tool
+def search_by_date(start_date: str = None, end_date: str = None, collection_name: str = None) -> str:
+    """Search data by date range. Input format: YYYY-MM-DD, "COLLECTION NAME"
+
+    Args:
+        start_date (str, optional): start date by filter. Defaults to None.
+        end_date (str, optional): end date by filter. Defaults to None.
+        collection_name (str): collection name to find the data
+
+    Returns:
+        str: search result
+    """
+    query = {"detection_time": {"$gte": start_date, "$lte": end_date}}
+    # print(collection_name)
+    
+    results = list(mongodb_client[DB_NAME][collection_name].find(query).limit(10))
+    
+    return results
+
 # def save_conversation_history(state: ConversationState):
 #     """대화가 종료되면 전체 대화 내용을 MongoDB에 저장합니다."""
 #     try:
@@ -157,8 +220,14 @@ def build_conversation_graph() -> StateGraph:
 #         print(f"대화 내용 저장 중 오류 발생: {str(e)}")
 
 def main():
+    # LLM 설정
+    llm_model = ChatOllama(model="llama3.1")
+    
+    tools = [list_available_collections, search_by_date]
+    llm_model = llm_model.bind_tools(tools)
+
     # 대화 그래프 생성
-    graph = build_conversation_graph()
+    graph = build_conversation_graph(llm_model, tools)
     graph_image = graph.get_graph(xray=True).draw_mermaid_png()
     display(Image(graph_image))
     
@@ -192,9 +261,6 @@ def main():
         # if state.current_step == END:
         #     save_conversation_history(state)
         #     break
-        
-        if initial_state.get("messages"):
-            print("AI:", initial_state["messages"][-1]["content"])
 
 if __name__ == "__main__":
     main()
